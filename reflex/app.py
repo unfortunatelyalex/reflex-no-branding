@@ -11,17 +11,17 @@ import functools
 import inspect
 import io
 import json
-import multiprocessing
-import platform
 import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from timeit import default_timer as timer
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
+    BinaryIO,
     Callable,
     Coroutine,
     Dict,
@@ -35,12 +35,15 @@ from typing import (
     get_type_hints,
 )
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request
+from fastapi import UploadFile as FastAPIUploadFile
 from fastapi.middleware import cors
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from rich.progress import MofNCompleteColumn, Progress, TimeElapsedColumn
 from socketio import ASGIApp, AsyncNamespace, AsyncServer
+from starlette.datastructures import Headers
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette_admin.contrib.sqla.admin import Admin
 from starlette_admin.contrib.sqla.view import ModelView
 
@@ -72,7 +75,8 @@ from reflex.components.core.client_side_routing import (
 # from reflex.components.core.sticky import sticky
 from reflex.components.core.upload import Upload, get_upload_dir
 from reflex.components.radix import themes
-from reflex.config import environment, get_config
+from reflex.components.sonner.toast import toast
+from reflex.config import ExecutorType, environment, get_config
 from reflex.event import (
     _EVENT_FIELDS,
     Event,
@@ -81,7 +85,6 @@ from reflex.event import (
     EventType,
     IndividualEventType,
     get_hydrate_event,
-    window_alert,
 )
 from reflex.model import Model, get_db_status
 from reflex.page import DECORATED_PAGES
@@ -97,6 +100,7 @@ from reflex.state import (
     StateManager,
     StateUpdate,
     _substate_key,
+    all_base_state_classes,
     code_uses_state_contexts,
 )
 from reflex.utils import (
@@ -113,6 +117,7 @@ from reflex.utils.imports import ImportVar
 
 if TYPE_CHECKING:
     from reflex.vars import Var
+
 
 # Define custom types.
 ComponentCallable = Callable[[], Component]
@@ -139,7 +144,7 @@ def default_backend_exception_handler(exception: Exception) -> EventSpec:
         EventSpec: The window alert event.
 
     """
-    from reflex.components.sonner.toast import Toaster, toast
+    from reflex.components.sonner.toast import toast
 
     error = traceback.format_exc()
 
@@ -150,18 +155,44 @@ def default_backend_exception_handler(exception: Exception) -> EventSpec:
         if is_prod_mode()
         else [f"{type(exception).__name__}: {exception}.", "See logs for details."]
     )
-    if Toaster.is_used:
-        return toast(
-            "An error occurred.",
-            level="error",
-            description="<br/>".join(error_message),
-            position="top-center",
-            id="backend_error",
-            style={"width": "500px"},
-        )
-    else:
-        error_message.insert(0, "An error occurred.")
-        return window_alert("\n".join(error_message))
+
+    return toast(
+        "An error occurred.",
+        level="error",
+        fallback_to_alert=True,
+        description="<br/>".join(error_message),
+        position="top-center",
+        id="backend_error",
+        style={"width": "500px"},
+    )
+
+
+def extra_overlay_function() -> Optional[Component]:
+    """Extra overlay function to add to the overlay component.
+
+    Returns:
+        The extra overlay function.
+    """
+    config = get_config()
+
+    extra_config = config.extra_overlay_function
+    config_overlay = None
+    if extra_config:
+        module, _, function_name = extra_config.rpartition(".")
+        try:
+            module = __import__(module)
+            config_overlay = Fragment.create(getattr(module, function_name)())
+            config_overlay._get_all_imports()
+        except Exception as e:
+            from reflex.compiler.utils import save_error
+
+            log_path = save_error(e)
+
+            console.error(
+                f"Error loading extra_overlay_function {extra_config}. Error saved to {log_path}"
+            )
+
+    return config_overlay
 
 
 def default_overlay_component() -> Component:
@@ -170,14 +201,21 @@ def default_overlay_component() -> Component:
     Returns:
         The default overlay_component, which is a connection_modal.
     """
-    config = get_config()
+    from reflex.components.component import memo
 
-    return Fragment.create(
-        connection_pulser(),
-        connection_toaster(),
-        *([backend_disabled()] if config.is_reflex_cloud else []),
-        *codespaces.codespaces_auto_redirect(),
-    )
+    def default_overlay_components():
+        return Fragment.create(
+            connection_pulser(),
+            connection_toaster(),
+            *(
+                [backend_disabled()]
+                if get_compile_context() == constants.CompileContext.DEPLOY
+                else []
+            ),
+            *codespaces.codespaces_auto_redirect(),
+        )
+
+    return Fragment.create(memo(default_overlay_components)())
 
 
 def default_error_boundary(*children: Component) -> Component:
@@ -197,6 +235,53 @@ class OverlayFragment(Fragment):
     """Alias for Fragment, used to wrap the overlay_component."""
 
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class UploadFile(StarletteUploadFile):
+    """A file uploaded to the server.
+
+    Args:
+        file: The standard Python file object (non-async).
+        filename: The original file name.
+        size: The size of the file in bytes.
+        headers: The headers of the request.
+    """
+
+    file: BinaryIO
+
+    path: Optional[Path] = dataclasses.field(default=None)
+
+    _deprecated_filename: Optional[str] = dataclasses.field(default=None)
+
+    size: Optional[int] = dataclasses.field(default=None)
+
+    headers: Headers = dataclasses.field(default_factory=Headers)
+
+    @property
+    def name(self) -> Optional[str]:
+        """Get the name of the uploaded file.
+
+        Returns:
+            The name of the uploaded file.
+        """
+        if self.path:
+            return self.path.name
+
+    @property
+    def filename(self) -> Optional[str]:
+        """Get the filename of the uploaded file.
+
+        Returns:
+            The filename of the uploaded file.
+        """
+        console.deprecate(
+            feature_name="UploadFile.filename",
+            reason="Use UploadFile.name instead.",
+            deprecation_version="0.7.1",
+            removal_version="0.8.0",
+        )
+        return self._deprecated_filename
 
 
 @dataclasses.dataclass(
@@ -249,11 +334,26 @@ class App(MiddlewareMixin, LifespanMixin):
 
     # A component that is present on every page (defaults to the Connection Error banner).
     overlay_component: Optional[Union[Component, ComponentCallable]] = (
-        dataclasses.field(default_factory=default_overlay_component)
+        dataclasses.field(default=None)
     )
 
     # Error boundary component to wrap the app with.
-    error_boundary: Optional[ComponentCallable] = default_error_boundary
+    error_boundary: Optional[ComponentCallable] = dataclasses.field(default=None)
+
+    # App wraps to be applied to the whole app. Expected to be a dictionary of (order, name) to a function that takes whether the state is enabled and optionally returns a component.
+    app_wraps: Dict[tuple[int, str], Callable[[bool], Optional[Component]]] = (
+        dataclasses.field(
+            default_factory=lambda: {
+                (55, "ErrorBoundary"): (
+                    lambda stateful: default_error_boundary() if stateful else None
+                ),
+                (5, "Overlay"): (
+                    lambda stateful: default_overlay_component() if stateful else None
+                ),
+                (4, "ExtraOverlay"): lambda stateful: extra_overlay_function(),
+            }
+        )
+    )
 
     # Components to add to the head of every page.
     head_components: List[Component] = dataclasses.field(default_factory=list)
@@ -274,6 +374,9 @@ class App(MiddlewareMixin, LifespanMixin):
 
     # A map from a page route to the component to render. Users should use `add_page`.
     _pages: Dict[str, Component] = dataclasses.field(default_factory=dict)
+
+    # A mapping of pages which created states as they were being evaluated.
+    _stateful_pages: Dict[str, None] = dataclasses.field(default_factory=dict)
 
     # The backend API object.
     _api: FastAPI | None = None
@@ -307,6 +410,9 @@ class App(MiddlewareMixin, LifespanMixin):
     backend_exception_handler: Callable[
         [Exception], Union[EventSpec, List[EventSpec], None]
     ] = default_backend_exception_handler
+
+    # Put the toast provider in the app wrap.
+    toaster: Component | None = dataclasses.field(default_factory=toast.provider)
 
     @property
     def api(self) -> FastAPI | None:
@@ -489,8 +595,10 @@ class App(MiddlewareMixin, LifespanMixin):
         """Add optional api endpoints (_upload)."""
         if not self.api:
             return
-
-        if Upload.is_used:
+        upload_is_used_marker = (
+            prerequisites.get_backend_dir() / constants.Dirs.UPLOAD_IS_USED
+        )
+        if Upload.is_used or upload_is_used_marker.exists():
             # To upload files.
             self.api.post(str(constants.Endpoint.UPLOAD))(upload(self))
 
@@ -500,10 +608,15 @@ class App(MiddlewareMixin, LifespanMixin):
                 StaticFiles(directory=get_upload_dir()),
                 name="uploaded_files",
             )
+
+            upload_is_used_marker.parent.mkdir(parents=True, exist_ok=True)
+            upload_is_used_marker.touch()
         if codespaces.is_running_in_codespaces():
             self.api.get(str(constants.Endpoint.AUTH_CODESPACE))(
                 codespaces.auth_codespace
             )
+        if environment.REFLEX_ADD_ALL_ROUTES_ENDPOINT.get():
+            self.add_all_routes_endpoint()
 
     def _add_cors(self):
         """Add CORS middleware to the app."""
@@ -541,7 +654,9 @@ class App(MiddlewareMixin, LifespanMixin):
         Returns:
             The generated component.
         """
-        return component if isinstance(component, Component) else component()
+        from reflex.compiler.compiler import into_component
+
+        return into_component(component)
 
     def add_page(
         self,
@@ -642,12 +757,18 @@ class App(MiddlewareMixin, LifespanMixin):
             route: The route of the page to compile.
             save_page: If True, the compiled page is saved to self._pages.
         """
+        n_states_before = len(all_base_state_classes)
         component, enable_state = compiler.compile_unevaluated_page(
             route, self._unevaluated_pages[route], self._state, self.style, self.theme
         )
 
+        # Indicate that the app should use state.
         if enable_state:
             self._enable_state()
+
+        # Indicate that evaluating this page creates one or more state classes.
+        if len(all_base_state_classes) > n_states_before:
+            self._stateful_pages[route] = None
 
         # Add the page.
         self._check_routes_conflict(route)
@@ -956,6 +1077,20 @@ class App(MiddlewareMixin, LifespanMixin):
         def get_compilation_time() -> str:
             return str(datetime.now().time()).split(".")[0]
 
+        should_compile = self._should_compile()
+        backend_dir = prerequisites.get_backend_dir()
+        if not should_compile and backend_dir.exists():
+            stateful_pages_marker = backend_dir / constants.Dirs.STATEFUL_PAGES
+            if stateful_pages_marker.exists():
+                with stateful_pages_marker.open("r") as f:
+                    stateful_pages = json.load(f)
+                for route in stateful_pages:
+                    console.info(f"BE Evaluating stateful page: {route}")
+                    self._compile_page(route, save_page=False)
+                self._enable_state()
+            self._add_optional_endpoints()
+            return
+
         # Render a default 404 page if the user didn't supply one
         if constants.Page404.SLUG not in self._unevaluated_pages:
             self.add_page(route=constants.Page404.SLUG)
@@ -1029,7 +1164,7 @@ class App(MiddlewareMixin, LifespanMixin):
         progress.advance(task)
 
         # Store the compile results.
-        compile_results = []
+        compile_results: list[tuple[str, str]] = []
 
         progress.advance(task)
 
@@ -1112,11 +1247,12 @@ class App(MiddlewareMixin, LifespanMixin):
 
         ExecutorSafeFunctions.STATE = self._state
 
-        with executor:
-            result_futures = []
+        with console.timing("Compile to Javascript"), executor as executor:
+            result_futures: list[concurrent.futures.Future[tuple[str, str]]] = []
 
-            def _submit_work(fn: Callable, *args, **kwargs):
+            def _submit_work(fn: Callable[..., tuple[str, str]], *args, **kwargs):
                 f = executor.submit(fn, *args, **kwargs)
+                f.add_done_callback(lambda _: progress.advance(task))
                 result_futures.append(f)
 
             # Compile the pre-compiled pages.
@@ -1170,10 +1306,12 @@ class App(MiddlewareMixin, LifespanMixin):
         progress.advance(task)
 
         # Compile custom components.
-        *custom_components_result, custom_components_imports = (
-            compiler.compile_components(custom_components)
-        )
-        compile_results.append(custom_components_result)
+        (
+            custom_components_output,
+            custom_components_result,
+            custom_components_imports,
+        ) = compiler.compile_components(custom_components)
+        compile_results.append((custom_components_output, custom_components_result))
         all_imports.update(custom_components_imports)
 
         progress.advance(task)
@@ -1517,7 +1655,7 @@ def upload(app: App):
         The upload function.
     """
 
-    async def upload_file(request: Request, files: List[UploadFile]):
+    async def upload_file(request: Request, files: List[FastAPIUploadFile]):
         """Upload a file.
 
         Args:
@@ -1593,7 +1731,8 @@ def upload(app: App):
             file_copies.append(
                 UploadFile(
                     file=content_copy,
-                    filename=file.filename,
+                    path=Path(file.filename.lstrip("/")) if file.filename else None,
+                    _deprecated_filename=file.filename,
                     size=file.size,
                     headers=file.headers,
                 )
