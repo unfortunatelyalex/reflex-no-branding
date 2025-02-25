@@ -69,7 +69,7 @@ from reflex.components.core.client_side_routing import (
     Default404Page,
     wait_for_client_redirect,
 )
-from reflex.components.core.sticky import sticky
+# from reflex.components.core.sticky import sticky
 from reflex.components.core.upload import Upload, get_upload_dir
 from reflex.components.radix import themes
 from reflex.config import environment, get_config
@@ -882,14 +882,14 @@ class App(MiddlewareMixin, LifespanMixin):
                 continue
             self._pages[k] = self._add_error_boundary_to_component(component)
 
-    def _setup_sticky_badge(self):
-        """Add the sticky badge to the app."""
-        for k, component in self._pages.items():
-            # Would be nice to share single sticky_badge across all pages, but
-            # it bungles the StatefulComponent compile step.
-            sticky_badge = sticky()
-            sticky_badge._add_style_recursive({})
-            self._pages[k] = Fragment.create(sticky_badge, component)
+    # def _setup_sticky_badge(self):
+    #     """Add the sticky badge to the app."""
+    #     for k, component in self._pages.items():
+    #         # Would be nice to share single sticky_badge across all pages, but
+    #         # it bungles the StatefulComponent compile step.
+    #         sticky_badge = sticky()
+    #         sticky_badge._add_style_recursive({})
+    #         self._pages[k] = Fragment.create(sticky_badge, component)
 
     def _apply_decorated_pages(self):
         """Add @rx.page decorated pages to the app.
@@ -1023,8 +1023,8 @@ class App(MiddlewareMixin, LifespanMixin):
         self._validate_var_dependencies()
         self._setup_overlay_component()
         self._setup_error_boundary()
-        if is_prod_mode() and config.show_built_with_reflex:
-            self._setup_sticky_badge()
+        # if is_prod_mode() and config.show_built_with_reflex:
+        #     self._setup_sticky_badge()
 
         progress.advance(task)
 
