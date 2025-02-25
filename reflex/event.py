@@ -21,9 +21,19 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
+    get_type_hints,
+    overload,
+)
+
+from typing_extensions import (
+    Protocol,
+    Self,
+    TypeAliasType,
     TypedDict,
     TypeVar,
-    Union,
+    TypeVarTuple,
+    Unpack,
     get_args,
     get_origin,
     get_type_hints,

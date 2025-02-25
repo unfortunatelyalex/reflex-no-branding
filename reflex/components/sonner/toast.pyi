@@ -9,7 +9,6 @@ from reflex.base import Base
 from reflex.components.component import Component, ComponentNamespace
 from reflex.components.lucide.icon import Icon
 from reflex.components.props import NoExtrasAllowedProps, PropsBase
-from reflex.constants.base import Dirs
 from reflex.event import EventSpec, EventType
 from reflex.style import Style
 from reflex.utils.imports import ImportVar

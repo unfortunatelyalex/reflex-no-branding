@@ -340,7 +340,10 @@ def export(
     from reflex.utils import export as export_utils
     from reflex.utils import prerequisites
 
-    environment.REFLEX_COMPILE_CONTEXT.set(constants.CompileContext.EXPORT)
+    frontend, backend = prerequisites.check_running_mode(frontend, backend)
+
+    if prerequisites.needs_reinit(frontend=frontend or not backend):
+        _init(name=config.app_name, loglevel=loglevel)
 
     frontend, backend = prerequisites.check_running_mode(frontend, backend)
 

@@ -112,7 +112,7 @@ from reflex.utils import (
     prerequisites,
     types,
 )
-from reflex.utils.exec import get_compile_context, is_prod_mode, is_testing_env
+from reflex.utils.exec import is_prod_mode, is_testing_env
 from reflex.utils.imports import ImportVar
 
 if TYPE_CHECKING:
@@ -984,6 +984,25 @@ class App(MiddlewareMixin, LifespanMixin):
         for k, component in self._pages.items():
             self._pages[k] = self._add_overlay_to_component(component)
 
+    def _add_error_boundary_to_component(self, component: Component) -> Component:
+        if self.error_boundary is None:
+            return component
+
+        component = self.error_boundary(*component.children)
+
+        return component
+
+    def _setup_error_boundary(self):
+        """If a State is not used and no error_boundary is specified, do not render the error boundary."""
+        if self._state is None and self.error_boundary is default_error_boundary:
+            self.error_boundary = None
+
+        for k, component in self._pages.items():
+            # Skip the 404 page
+            if k == constants.Page404.SLUG:
+                continue
+            self._pages[k] = self._add_error_boundary_to_component(component)
+
     # def _setup_sticky_badge(self):
     #     """Add the sticky badge to the app."""
     #     for k, component in self._pages.items():
@@ -1128,39 +1147,17 @@ class App(MiddlewareMixin, LifespanMixin):
         )
 
         with console.timing("Evaluate Pages (Frontend)"):
-            performance_metrics: list[tuple[str, float]] = []
             for route in self._unevaluated_pages:
                 console.debug(f"Evaluating page: {route}")
-                start = timer()
                 self._compile_page(route, save_page=should_compile)
-                end = timer()
-                performance_metrics.append((route, end - start))
                 progress.advance(task)
-            console.debug(
-                "Slowest pages:\n"
-                + "\n".join(
-                    f"{route}: {time * 1000:.1f}ms"
-                    for route, time in sorted(
-                        performance_metrics, key=lambda x: x[1], reverse=True
-                    )[:10]
-                )
-            )
 
         # Add the optional endpoints (_upload)
         self._add_optional_endpoints()
 
         self._validate_var_dependencies()
         self._setup_overlay_component()
-
-        # if config.show_built_with_reflex is None:
-        #     if (
-        #         get_compile_context() == constants.CompileContext.DEPLOY
-        #         and prerequisites.get_user_tier() in ["pro", "team", "enterprise"]
-        #     ):
-        #         config.show_built_with_reflex = False
-        #     else:
-        #         config.show_built_with_reflex = True
-
+        self._setup_error_boundary()
         # if is_prod_mode() and config.show_built_with_reflex:
         #     self._setup_sticky_badge()
 
@@ -1186,35 +1183,6 @@ class App(MiddlewareMixin, LifespanMixin):
 
             # Add the custom components from the page to the set.
             custom_components |= component._get_all_custom_components()
-
-        if (toaster := self.toaster) is not None:
-            from reflex.components.component import memo
-
-            @memo
-            def memoized_toast_provider():
-                return toaster
-
-            toast_provider = Fragment.create(memoized_toast_provider())
-
-            app_wrappers[(1, "ToasterProvider")] = toast_provider
-
-        # Add the app wraps to the app.
-        for key, app_wrap in self.app_wraps.items():
-            component = app_wrap(self._state is not None)
-            if component is not None:
-                app_wrappers[key] = component
-
-        for component in app_wrappers.values():
-            custom_components |= component._get_all_custom_components()
-
-        if self.error_boundary:
-            console.deprecate(
-                feature_name="App.error_boundary",
-                reason="Use app_wraps instead.",
-                deprecation_version="0.7.1",
-                removal_version="0.8.0",
-            )
-            app_wrappers[(55, "ErrorBoundary")] = self.error_boundary()
 
         # Perform auto-memoization of stateful components.
         with console.timing("Auto-memoize StatefulComponents"):
@@ -1257,7 +1225,22 @@ class App(MiddlewareMixin, LifespanMixin):
                     ),
                 )
 
-        executor = ExecutorType.get_executor_from_environment()
+        # Use a forking process pool, if possible.  Much faster, especially for large sites.
+        # Fallback to ThreadPoolExecutor as something that will always work.
+        executor = None
+        if (
+            platform.system() in ("Linux", "Darwin")
+            and (number_of_processes := environment.REFLEX_COMPILE_PROCESSES.get())
+            is not None
+        ):
+            executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=number_of_processes or None,
+                mp_context=multiprocessing.get_context("fork"),
+            )
+        else:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=environment.REFLEX_COMPILE_THREADS.get() or None
+            )
 
         for route, component in zip(self._pages, page_components, strict=True):
             ExecutorSafeFunctions.COMPONENTS[route] = component
@@ -1295,10 +1278,10 @@ class App(MiddlewareMixin, LifespanMixin):
                 _submit_work(compiler.remove_tailwind_from_postcss)
 
             # Wait for all compilation tasks to complete.
-            compile_results.extend(
-                future.result()
-                for future in concurrent.futures.as_completed(result_futures)
-            )
+            with console.timing("Compile to Javascript"):
+                for future in concurrent.futures.as_completed(result_futures):
+                    compile_results.append(future.result())
+                    progress.advance(task)
 
         app_root = self._app_root(app_wrappers=app_wrappers)
 
@@ -1365,24 +1348,6 @@ class App(MiddlewareMixin, LifespanMixin):
         with console.timing("Write to Disk"):
             for output_path, code in compile_results:
                 compiler_utils.write_page(output_path, code)
-
-        # Write list of routes that create dynamic states for backend to use.
-        if self._state is not None:
-            stateful_pages_marker = (
-                prerequisites.get_backend_dir() / constants.Dirs.STATEFUL_PAGES
-            )
-            stateful_pages_marker.parent.mkdir(parents=True, exist_ok=True)
-            with stateful_pages_marker.open("w") as f:
-                json.dump(list(self._stateful_pages), f)
-
-    def add_all_routes_endpoint(self):
-        """Add an endpoint to the app that returns all the routes."""
-        if not self.api:
-            return
-
-        @self.api.get(str(constants.Endpoint.ALL_ROUTES))
-        async def all_routes():
-            return list(self._unevaluated_pages.keys())
 
     @contextlib.asynccontextmanager
     async def modify_state(self, token: str) -> AsyncIterator[BaseState]:
